@@ -5,6 +5,9 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
+-- TimeTrialBootstrap starts this controller on the server. Heartbeat moves the bars
+-- and checks each runner's position. The controller saves progress in a Run record
+-- and publishes the values the HUD needs through attributes on that Player.
 type RunStatus = "Ready" | "Racing" | "Finished"
 type Gate = { part: BasePart, index: number, respawn: CFrame }
 type Spinner = { part: BasePart, origin: CFrame, speed: number }
@@ -26,7 +29,8 @@ type Run = {
 	deathConnection: RBXScriptConnection?,
 }
 
--- Check players 20 times a second. The bars still move every frame.
+-- Aim for one player sample every 0.05 seconds to limit the number of volume checks.
+-- The bars move every Heartbeat so they still look smooth between samples.
 local SAMPLE_INTERVAL = 1 / 20
 local RESTART_COOLDOWN = 1
 local MAX_HORIZONTAL_SPEED = 48
@@ -58,7 +62,9 @@ local function setMessage(player: Player, message: string): ()
 	player:SetAttribute("TrialMessage", message)
 end
 
--- The HUD reads these attributes. Keep times and checkpoint changes on the server.
+-- Send a snapshot when race state changes. While racing, the HUD subtracts
+-- TrialStartedAt from GetServerTimeNow() locally, so there's no timer update to
+-- replicate each frame. After FINISH it displays the server's TrialFinalTime.
 local function publish(player: Player, run: Run): ()
 	player:SetAttribute("TrialStatus", run.status)
 	player:SetAttribute("TrialCheckpoint", run.checkpoint)
@@ -66,10 +72,14 @@ local function publish(player: Player, run: Run): ()
 	player:SetAttribute("TrialFinalTime", run.finishedTime)
 	player:SetAttribute("TrialBest", run.best)
 	player:SetAttribute("TrialDeaths", run.deaths)
+	-- START is index 0 and FINISH is the highest index. Only the gates between them count.
 	player:SetAttribute("TrialCheckpointCount", finishIndex - 1)
+	-- The array holds cumulative times in gate order. An empty array means no split yet.
 	player:SetAttribute("TrialLastSplit", run.splits[#run.splits] or 0)
 end
 
+-- A character can be missing its root during a respawn. Skip the position check
+-- until there is a living humanoid and a root to sample.
 local function getLivingRoot(player: Player): (BasePart?, Humanoid?)
 	local character = player.Character
 	if not character then
@@ -83,9 +93,12 @@ local function getLivingRoot(player: Player): (BasePart?, Humanoid?)
 	return root, humanoid
 end
 
--- Check in the part's local space so rotated gates and bars work too.
 local function contains(part: BasePart, position: Vector3, margin: Vector3): boolean
+	-- Convert the world position into coordinates relative to the part's center and axes.
+	-- The same box check then works even when a sweeper has rotated since the last sample.
 	local point = part.CFrame:PointToObjectSpace(position)
+	-- From the center, each face is half the part's size away. Check both sides of
+	-- each axis with math.abs(). Bars get extra space for the body, while gates use zero margin.
 	local halfSize = part.Size * 0.5 + margin
 	return math.abs(point.X) <= halfSize.X
 		and math.abs(point.Y) <= halfSize.Y
@@ -94,8 +107,11 @@ end
 
 local function respawnFrame(run: Run): CFrame
 	if run.status == "Racing" then
+		-- The gate's Respawn attribute gives us a position and facing on the course.
+		-- Index 0 gives a runner who hasn't reached checkpoint 1 a place to return to.
 		return gates[run.checkpoint].respawn
 	end
+	-- Raise the root above the lobby marker and turn it a quarter turn around local Y.
 	return lobby.CFrame * CFrame.new(0, 3.5, 0) * CFrame.Angles(0, -math.pi / 2, 0)
 end
 
@@ -119,6 +135,8 @@ local function beginRun(player: Player, run: Run, now: number): ()
 	run.startedAt = now
 	run.finishedTime = 0
 	run.deaths = 0
+	-- Entering START is the first gate event. Use its timestamp for both the total
+	-- run clock and the travel-time check from START to checkpoint 1.
 	run.lastGateAt = now
 	table.clear(run.splits)
 	setMessage(player, "Run started. Reach each checkpoint in order.")
@@ -139,14 +157,19 @@ local function restartRun(player: Player, run: Run): ()
 	run.deaths = 0
 	run.insideStart = false
 	table.clear(run.splits)
+	-- Change the state to Ready before moving the player. respawnFrame then picks
+	-- the lobby instead of a course gate. Keep best in the same Run record.
 	moveToCheckpoint(player, run)
 	setMessage(player, "Walk through START to begin. Your session best is kept.")
 	publish(player, run)
 end
 
 local function finishRun(player: Player, run: Run, now: number): ()
+	-- Freeze the result at the server sample that accepted FINISH. Changing the
+	-- status also takes this player out of the racing checks in samplePlayer.
 	run.status = "Finished"
 	run.finishedTime = now - run.startedAt
+	-- Zero is the initial value before this player has finished a run this session.
 	local improved = run.best == 0 or run.finishedTime < run.best
 	if improved then
 		run.best = run.finishedTime
@@ -156,11 +179,14 @@ local function finishRun(player: Player, run: Run, now: number): ()
 end
 
 local function visitGate(player: Player, run: Run, gate: Gate, now: number): ()
+	-- The next index is the only one that can advance the run. This also ignores
+	-- repeated samples inside the checkpoint the player has already saved.
 	if run.status ~= "Racing" or gate.index ~= run.checkpoint + 1 then
 		return
 	end
-	-- Use the straight-line distance as the shortest possible trip between gates.
-	-- This is only a basic check for instant skips.
+	-- Estimate a fast crossing using the distance between gate centers divided by
+	-- the allowed speed. Compare that with the time since the last accepted gate.
+	-- This catches obvious instant skips, using gate centers as an approximation.
 	local previous = gates[run.checkpoint]
 	local minimumTravelTime = (gate.part.Position - previous.part.Position).Magnitude / MAX_HORIZONTAL_SPEED
 	if now - run.lastGateAt < minimumTravelTime then
@@ -168,6 +194,8 @@ local function visitGate(player: Player, run: Run, gate: Gate, now: number): ()
 		moveToCheckpoint(player, run)
 		return
 	end
+	-- Update the timestamp only after validation so a rejected gate can't become
+	-- the starting point of the next travel-time check.
 	run.lastGateAt = now
 	-- Splits are measured from START, rather than from the previous checkpoint.
 	table.insert(run.splits, now - run.startedAt)
@@ -185,11 +213,14 @@ local function samplePlayer(player: Player, run: Run, now: number): ()
 	if not root or not humanoid then
 		return
 	end
+	-- A fall uses Roblox's normal death/respawn flow. The next CharacterAdded
+	-- callback uses the Run record to decide where the new character should land.
 	if root.Position.Y < course:GetAttribute("FallHeight") then
 		humanoid.Health = 0
 		return
 	end
-	-- Start once when they enter the gate, rather than every time we check it.
+	-- Compare this sample with the previous one to detect entering START. Only
+	-- Ready players can start a run, so walking back through START can't reset the clock.
 	local startInside = contains(gates[0].part, root.Position, Vector3.zero)
 	if startInside and not run.insideStart and run.status == "Ready" then
 		beginRun(player, run, now)
@@ -200,8 +231,10 @@ local function samplePlayer(player: Player, run: Run, now: number): ()
 	end
 	if run.lastPosition then
 		local delta = root.Position - run.lastPosition
+		-- Ignore changes in height so jumps and falls don't use up the horizontal allowance.
 		local horizontalDistance = Vector2.new(delta.X, delta.Z).Magnitude
-		-- Leave some room for normal delays between position updates.
+		-- Speed times elapsed seconds gives a distance in studs. Add a fixed buffer
+		-- because character positions can arrive unevenly over the network.
 		local allowed = POSITION_ALLOWANCE + MAX_HORIZONTAL_SPEED * (now - run.lastSampleAt)
 		if horizontalDistance > allowed then
 			setMessage(player, "Large movement detected. Returned to your saved checkpoint.")
@@ -211,6 +244,8 @@ local function samplePlayer(player: Player, run: Run, now: number): ()
 	end
 	run.lastPosition = root.Position
 	run.lastSampleAt = now
+	-- Resolve hazards before checkpoints. If both checks would hit on this sample,
+	-- the death takes priority and the runner keeps the previously saved gate.
 	for _, spinner in spinners do
 		if contains(spinner.part, root.Position, BODY_MARGIN) then
 			humanoid.Health = 0
@@ -220,6 +255,8 @@ local function samplePlayer(player: Player, run: Run, now: number): ()
 	for index = 1, finishIndex do
 		local gate = gates[index]
 		if contains(gate.part, root.Position, Vector3.zero) then
+			-- Reaching a later gate sends the player back. visitGate handles the
+			-- expected gate and ignores old ones, so standing in a gate can't record extra splits.
 			if index > run.checkpoint + 1 then
 				setMessage(player, "Checkpoints must be reached in order.")
 				moveToCheckpoint(player, run)
@@ -232,17 +269,19 @@ local function samplePlayer(player: Player, run: Run, now: number): ()
 end
 
 local function onCharacter(player: Player, run: Run, character: Model): ()
+	-- Give each spawn a new generation so a task still waiting on the last
+	-- character can tell when a newer CharacterAdded callback has taken over.
 	run.generation += 1
 	local generation = run.generation
 	if run.deathConnection then
 		run.deathConnection:Disconnect()
 		run.deathConnection = nil
 	end
-	-- The player might respawn again while WaitForChild is waiting.
-	-- Ignore this task if it belongs to an older character.
 	task.spawn(function(): ()
 		local humanoid = character:WaitForChild("Humanoid", 10)
 		local root = character:WaitForChild("HumanoidRootPart", 10)
+		-- Both waits can yield. Recheck the Run and character before touching the
+		-- new root in case the player reset, left, or the controller stopped.
 		if runs[player] ~= run or run.generation ~= generation or player.Character ~= character then
 			return
 		end
@@ -257,6 +296,8 @@ local function onCharacter(player: Player, run: Run, character: Model): ()
 				publish(player, run)
 			end
 		end)
+		-- Death didn't clear the run. Move the new character using the checkpoint
+		-- and race state that are current now, after the wait for its parts.
 		moveToCheckpoint(player, run)
 	end)
 end
@@ -306,10 +347,13 @@ local function loadCourse(): ()
 		assert(typeof(index) == "number" and index >= 0 and index % 1 == 0, "Invalid gate index")
 		assert(typeof(respawn) == "CFrame", "Gate needs a Respawn CFrame")
 		assert(gates[index] == nil, "Duplicate gate index")
+		-- Key by the authored Index attribute so course order is independent of Explorer order.
 		gates[index] = { part = instance, index = index, respawn = respawn }
 		finishIndex = math.max(finishIndex, index)
 	end
 	assert(finishIndex >= 2 and typeof(course:GetAttribute("FallHeight")) == "number", "Invalid course configuration")
+	-- visitGate expects checkpoint + 1 to exist until FINISH. Catch gaps at startup
+	-- instead of discovering a missing gate midway through someone's race.
 	for index = 0, finishIndex do
 		assert(gates[index], "Gate indices must be consecutive, starting at zero")
 	end
@@ -332,6 +376,8 @@ function Controller.Start(): ()
 	restart.Name = "TimeTrialRestart"
 	restart.Parent = ReplicatedStorage
 	remote = restart
+	-- The HUD sends a restart request with no race data. OnServerEvent supplies
+	-- the sending Player, so the server picks the run and applies its own cooldown.
 	table.insert(connections, restart.OnServerEvent:Connect(function(player: Player): ()
 		local run = runs[player]
 		if run then
@@ -340,20 +386,25 @@ function Controller.Start(): ()
 	end))
 	table.insert(connections, Players.PlayerAdded:Connect(addPlayer))
 	table.insert(connections, Players.PlayerRemoving:Connect(removePlayer))
+	-- Start can run after players have already joined. addPlayer checks for an
+	-- existing run so this pass and PlayerAdded can't install duplicate listeners.
 	for _, player in Players:GetPlayers() do
 		addPlayer(player)
 	end
 	table.insert(connections, RunService.Heartbeat:Connect(function(deltaTime: number): ()
 		local now = Workspace:GetServerTimeNow()
 		for _, spinner in spinners do
-			-- Work from the original CFrame so small rotation errors don't build up.
+			-- Elapsed seconds times radians per second gives the angle around local Y.
+			-- Multiply by the original CFrame so each update keeps the same pivot
+			-- and a slow frame doesn't make the bar fall behind.
 			spinner.part.CFrame = spinner.origin * CFrame.Angles(0, (now - motionEpoch) * spinner.speed, 0)
 		end
 		accumulator += deltaTime
 		if accumulator < SAMPLE_INTERVAL then
 			return
 		end
-		-- After a slow frame, check once instead of replaying the missed checks.
+		-- Keep the time left over after removing whole sample intervals. After a
+		-- slow frame we check once because we only have the current positions.
 		accumulator %= SAMPLE_INTERVAL
 		for player, run in runs do
 			samplePlayer(player, run, now)
@@ -366,6 +417,7 @@ function Controller.Stop(): ()
 		return
 	end
 	running = false
+	-- Stop the frame and player callbacks before clearing the state they read.
 	disconnectAll(connections)
 	for player in runs do
 		removePlayer(player)
